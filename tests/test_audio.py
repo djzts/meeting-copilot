@@ -111,3 +111,163 @@ def test_wav_roundtrip_and_simulated_pipeline(tmp_path):
         segs.append(q.get())
     assert len(segs) == 2
     assert all(s.wall_end <= s.wall_ready for s in segs)
+
+
+# --------------------------------------------------------------------------- #
+# WASAPI loopback, with a fake PyAudioWPatch and a fake clock
+# --------------------------------------------------------------------------- #
+import types  # noqa: E402
+
+import audio  # noqa: E402
+from audio import parse_loopback  # noqa: E402
+
+
+class FakeClock:
+    def __init__(self, stop_at, stop_event=None):
+        self.t = 0.0
+        self.stop_at = stop_at
+        self.stop_event = stop_event
+
+    def monotonic(self):
+        return self.t
+
+    def time(self):
+        return 1_000_000.0 + self.t
+
+    def sleep(self, dt):
+        self.t += dt
+        if self.t >= self.stop_at and self.stop_event is not None:
+            self.stop_event.set()
+
+
+class FakeStream:
+    """Like WASAPI loopback: frames are only available while something plays."""
+
+    def __init__(self, clock, rate, channels, plays, stall=None):
+        self.clock, self.rate, self.channels, self.plays = clock, rate, channels, plays
+        self.read_until = clock.t
+        self.closed = False
+        self.stall = stall  # (at, duration, buffer_sec): the reader freezes, the buffer overflows
+
+    def _available_sec(self):
+        t = self.clock.t
+        return sum(max(0.0, min(e, t) - max(s, self.read_until)) for s, e in self.plays)
+
+    def get_read_available(self):
+        if self.stall and self.clock.t >= self.stall[0]:
+            at, dur, buffer_sec = self.stall
+            self.stall = None
+            self.clock.t += dur  # this thread was frozen; only the last buffer_sec survived
+            self.read_until = max(self.read_until, self.clock.t - buffer_sec)
+        return int(self._available_sec() * self.rate)
+
+    def read(self, n, exception_on_overflow=True):
+        self.read_until = self.clock.t
+        x = (0.2 * np.sin(2 * np.pi * 300 * np.arange(n) / self.rate)).astype(np.float32)
+        return np.repeat(x[:, None], self.channels, axis=1).tobytes()
+
+    def close(self):
+        self.closed = True
+
+
+def fake_pa(clock, devices, plays, default_names, stall=None):
+    """A stand-in for the pyaudiowpatch module. default_names[i] is the default
+    output for the i-th PyAudio() instance (the last one repeats)."""
+    state = {"opened": 0, "streams": []}
+
+    class FakePyAudio:
+        def __init__(self):
+            self.n = state["opened"]
+            state["opened"] += 1
+
+        def get_loopback_device_info_generator(self):
+            yield from devices
+
+        def get_default_wasapi_loopback(self):
+            name = default_names[min(self.n, len(default_names) - 1)]
+            return next(d for d in devices if d["name"].startswith(name))
+
+        def open(self, format, channels, rate, input, input_device_index, frames_per_buffer):
+            s = FakeStream(clock, rate, channels, plays, stall)
+            state["streams"].append(s)
+            return s
+
+        def terminate(self):
+            pass
+
+    return types.SimpleNamespace(PyAudio=FakePyAudio, paFloat32=1, state=state)
+
+
+DEVICES = [
+    {"index": 5, "name": "Remote Audio [Loopback]", "maxInputChannels": 2, "defaultSampleRate": 44100.0},
+    {"index": 7, "name": "Speakers (JBL Quantum 400) [Loopback]", "maxInputChannels": 2, "defaultSampleRate": 48000.0},
+]
+
+
+def run_loopback(monkeypatch, device, plays, stop_at, default_names=("Remote Audio",), stall=None):
+    q = queue.Queue()
+    sources = []
+    pipe = AudioPipeline(AudioConfig(device=device), q, on_source=sources.append)
+    clock = FakeClock(stop_at, pipe.stop_event)
+    pa = fake_pa(clock, DEVICES, plays, list(default_names), stall)
+    monkeypatch.setattr(audio, "_pa", lambda: pa)
+    monkeypatch.setattr(audio, "time", clock)
+    pipe._run_device()  # runs in this thread until the fake clock reaches stop_at
+    segs = []
+    while not q.empty():
+        segs.append(q.get())
+    return pipe, segs, sources, pa
+
+
+@pytest.mark.parametrize("spec,expected", [
+    ("loopback", ""), ("Loopback", ""), ("loopback:JBL", "JBL"), (" loopback: Remote ", "Remote"),
+    ("Speakers (Realtek) [Loopback]", "Speakers (Realtek) [Loopback]"),
+    ("Stereo Mix", None), ("CABLE Output", None), ("", None),
+])
+def test_parse_loopback(spec, expected):
+    assert parse_loopback(spec) == expected
+
+
+def test_loopback_pads_silence_so_the_utterance_is_cut(monkeypatch):
+    # audio plays 0.5-2.0 s; afterwards WASAPI delivers nothing at all
+    pipe, segs, _, _ = run_loopback(monkeypatch, "loopback", plays=[(0.5, 2.0)], stop_at=4.0)
+    assert pipe.error is None
+    assert pipe.source_name == "Remote Audio [Loopback]"
+    assert len(segs) == 1
+    s = segs[0]
+    assert s.t_end == pytest.approx(2.0, abs=0.1)  # stream time tracks wall-clock time
+    # cut by the VAD ~0.8 s after the audio stopped, not by the final flush at 4.0 s
+    assert s.wall_ready - 1_000_000.0 < 3.2
+
+
+def test_loopback_two_utterances_with_idle_gap(monkeypatch):
+    pipe, segs, _, _ = run_loopback(monkeypatch, "loopback:JBL", plays=[(0.2, 1.4), (3.0, 4.0)], stop_at=6.0)
+    assert pipe.source_name.startswith("Speakers (JBL")
+    # stream time stays in step with wall-clock time across the idle gap
+    assert [s.t_end for s in segs] == pytest.approx([1.4, 4.0], abs=0.04)
+
+
+def test_loopback_follows_a_new_default_output(monkeypatch):
+    # nothing plays for > LOOPBACK_RECHECK_SEC, then the default output changes to the JBL headset
+    pipe, _, sources, pa = run_loopback(monkeypatch, "loopback", plays=[], stop_at=12.0,
+                                        default_names=("Remote Audio", "Speakers (JBL"))
+    assert pa.state["opened"] >= 2
+    assert all(s.closed for s in pa.state["streams"][:-1])
+    assert sources == ["Speakers (JBL Quantum 400) [Loopback]"]
+    assert pipe.source_name.startswith("Speakers (JBL")
+
+
+def test_loopback_unknown_device_reports_error(monkeypatch):
+    pipe, segs, _, _ = run_loopback(monkeypatch, "loopback:Nope", plays=[], stop_at=1.0)
+    assert "No output device matches 'Nope'" in pipe.error
+    assert "Remote Audio [Loopback]" in pipe.error
+    assert pipe.finished.is_set() and segs == []
+
+
+def test_loopback_dropout_keeps_time_and_is_counted(monkeypatch):
+    # audio 0.5-3.0 s; at 1.5 s the reader stalls for 0.6 s and only 0.1 s survives in the buffer
+    pipe, segs, _, _ = run_loopback(monkeypatch, "loopback", plays=[(0.5, 3.0)], stop_at=5.0,
+                                    stall=(1.5, 0.6, 0.1))
+    assert pipe.dropped_sec == pytest.approx(0.5, abs=0.05)
+    assert len(segs) == 1
+    assert segs[0].t_end == pytest.approx(3.0, abs=0.04)  # still aligned with wall-clock time

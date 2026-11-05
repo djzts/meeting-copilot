@@ -74,13 +74,31 @@ meeting-copilot only listens to **system audio**, never your own microphone. You
 
 ### Windows
 
-Pick one of these:
+**Recommended: WASAPI loopback**, no extra software:
+
+```toml
+[audio]
+device = "loopback"          # or "loopback:JBL" to pin one output device
+```
+
+This records whatever the **default output device** is playing: headphones, a USB headset, speakers,
+or *Remote Audio* when you work over Remote Desktop. It needs `PyAudioWPatch` (in `requirements.txt`).
+
+- When nothing plays, Windows delivers no audio at all, so meeting-copilot fills those gaps with silence.
+  That lets the end of an utterance be detected and keeps the timestamps right.
+- While the device is silent, it rechecks the default output every 5 s, so switching to a headset
+  mid-meeting is picked up.
+- The capture buffer is 2 s, so a busy moment elsewhere in the app (for example loading the embedding
+  model) doesn't drop audio. If a dropout does happen, the console shows `loopback: … s of audio lost`.
+
+Alternatives:
 
 - **VB-Audio Virtual Cable** (<https://vb-audio.com/Cable/>). Set the meeting app's speaker to
   *CABLE Input*. To keep hearing the call, open *Sound settings → Recording → CABLE Output → Properties →
   Listen* and tick "Listen to this device" with your headphones. Use `device = "CABLE Output"`.
 - **Stereo Mix** (some Realtek drivers). Enable it in *Sound settings → Recording* (show disabled devices),
-  then use `device = "Stereo Mix"`.
+  then use `device = "Stereo Mix"`. It only hears the Realtek card, though: not a USB/Bluetooth headset,
+  and nothing at all over Remote Desktop.
 
 Speech model:
 
@@ -107,7 +125,7 @@ Settings you'll usually change:
 
 | key | meaning |
 |---|---|
-| `[audio] device` | part of the device name; empty → list devices and exit |
+| `[audio] device` | `"loopback"` (Windows), or part of an input device name; empty → list devices and exit |
 | `[stt] model`, `language`, `initial_prompt` | Whisper model, `""`/`"en"`/`"zh"`, domain terms to help spelling |
 | `[vault] path` | your Obsidian vault folder (relative paths are relative to the config file) |
 | `[vault] exclude` | globs to skip, e.g. `["NDA/**", "Private/**", "*.excalidraw.md"]` |
@@ -255,7 +273,8 @@ The status bar and every answer card show these numbers live.
 |---|---|
 | `Failed to authenticate` / `loggedIn: false` | run `claude` in a terminal and `/login` with your subscription account |
 | status bar says "Speech model error" | see the console; on Windows + CUDA install `nvidia-cublas-cu12 nvidia-cudnn-cu12`, or set `[stt] device = "cpu"` |
-| nothing gets transcribed | check the input level meter; raise the meeting volume or lower `silence_threshold` |
+| nothing gets transcribed | check the input level meter; raise the meeting volume or lower `silence_threshold`. With Stereo Mix, the sound must play through the Realtek card (not a USB headset, not Remote Desktop). Use `device = "loopback"` instead |
+| words missing mid-sentence | look for `loopback: … s of audio lost` in the console; something stalled the capture thread for > 2 s |
 | words cut in half | raise `end_silence_sec` (e.g. 1.0) |
 | answers are slow | keep `model = "haiku"`, lower `top_k`, set `allow_vault_tools = false` |
 | "Thank you." / subtitle credits appear | Whisper hallucinations on noise are filtered in `stt.py` (`_EXACT_HALLUCINATIONS`); add your own |

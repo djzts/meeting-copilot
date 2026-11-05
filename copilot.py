@@ -379,7 +379,8 @@ class App:
     def _start_audio(self) -> None:
         acfg = audio.AudioConfig.from_dict(self.cfg["audio"])
         self.pipeline = audio.AudioPipeline(acfg, self.seg_q, simulate=self.args.simulate,
-                                            on_level=self._on_level)
+                                            on_level=self._on_level,
+                                            on_source=lambda name: self.status(source=name))
         self.pipeline.start()
 
         def watch():

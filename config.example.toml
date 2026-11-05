@@ -1,8 +1,10 @@
 # meeting-copilot configuration. Copy to config.toml and edit.
 
 [audio]
-# Part of the input device name. Leave empty to list all devices and exit.
-#   Windows: "CABLE Output" (VB-Audio Virtual Cable) or "Stereo Mix"
+# What to record. Leave empty to list all devices and exit.
+#   Windows: "loopback" (recommended): whatever the default output device plays, headset,
+#            speakers or Remote Desktop audio; no extra software. "loopback:<part of an output
+#            device name>" pins one device. Or an input device: "CABLE Output" (VB-Cable), "Stereo Mix".
 #   macOS:   "BlackHole"
 device = ""
 silence_threshold = 0.01   # RMS of a 30 ms frame above this counts as speech

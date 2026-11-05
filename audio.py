@@ -258,9 +258,11 @@ def list_devices() -> str:
             continue
         api = apis[d["hostapi"]]["name"]
         lines.append(f"{i:>4}  {api:<20} {d['max_input_channels']:>3} {int(d['default_samplerate']):>7}  {d['name']}")
+    lines += _loopback_table()
     lines.append("")
     lines.append("Capture the meeting's audio (system output), not your own microphone:")
-    lines.append("  Windows: 'CABLE Output' (VB-Audio Virtual Cable) or 'Stereo Mix'")
+    lines.append("  Windows: 'loopback' (whatever the default output device plays; also works over Remote Desktop),")
+    lines.append("           'loopback:<part of an output device name>', 'CABLE Output' (VB-Cable) or 'Stereo Mix'")
     lines.append("  macOS:   'BlackHole'")
     return "\n".join(lines)
 
@@ -285,6 +287,76 @@ def find_device(name_part: str) -> int:
         raise ValueError(f"No input device matches {name_part!r}.\n\n" + list_devices())
     matches.sort()
     return matches[0][1]
+
+
+# --------------------------------------------------------------------------- #
+# WASAPI loopback (Windows): record what an output device is playing
+# --------------------------------------------------------------------------- #
+LOOPBACK_PAD_SEC = 0.1  # no packets for this long -> nothing is playing, feed silence
+LOOPBACK_RECHECK_SEC = 5.0  # silent this long -> reopen, in case the default output device changed
+# frames_per_buffer for the loopback stream. WASAPI then buffers ~2x this (2 s), so the
+# reader survives the GIL being held elsewhere (loading the embedding model held it for
+# ~0.5 s and dropped audio with the default 0.1 s buffer). Reads still arrive every ~10 ms.
+LOOPBACK_BUFFER_SEC = 1.0
+LOOPBACK_DROPOUT_SEC = 0.15  # more wall-clock time passed than audio arrived: count it as lost
+
+
+def _pa():
+    try:
+        import pyaudiowpatch as pa  # imported lazily: Windows only, optional
+    except ImportError as e:
+        raise RuntimeError("loopback capture needs PyAudioWPatch (Windows only): pip install PyAudioWPatch") from e
+    return pa
+
+
+def parse_loopback(device: str) -> Optional[str]:
+    """Return the output-device filter for a loopback spec, or None if it isn't one.
+
+    "loopback" -> "" (the default output device), "loopback:JBL" -> "JBL",
+    "Speakers (Realtek) [Loopback]" (a name copied from --list-devices) -> that name.
+    """
+    d = (device or "").strip()
+    low = d.lower()
+    if low == "loopback":
+        return ""
+    if low.startswith("loopback:"):
+        return d.split(":", 1)[1].strip()
+    if "[loopback]" in low:
+        return d
+    return None
+
+
+def _pick_loopback(p, name_part: str) -> dict:
+    if not name_part:
+        return p.get_default_wasapi_loopback()
+    needle = name_part.lower().replace("[loopback]", "").strip()
+    devices = list(p.get_loopback_device_info_generator())
+    for d in devices:
+        if needle in d["name"].lower():
+            return d
+    names = ", ".join(repr(d["name"]) for d in devices) or "none"
+    raise ValueError(f"No output device matches {name_part!r} for loopback capture. Available: {names}")
+
+
+def _loopback_table() -> list[str]:
+    try:
+        pa = _pa()
+    except RuntimeError:
+        return []
+    p = pa.PyAudio()
+    try:
+        try:
+            default = p.get_default_wasapi_loopback()["name"]
+        except Exception:  # noqa: BLE001 - no default output device
+            default = ""
+        lines = ["", "Loopback (records what an output device plays; Windows):", ""]
+        for d in p.get_loopback_device_info_generator():
+            mark = "  <- default output" if d["name"] == default else ""
+            lines.append(f"{'':>4}  {'WASAPI loopback':<20} {d['maxInputChannels']:>3} "
+                         f"{int(d['defaultSampleRate']):>7}  {d['name']}{mark}")
+        return lines
+    finally:
+        p.terminate()
 
 
 # --------------------------------------------------------------------------- #
@@ -316,16 +388,19 @@ class AudioPipeline:
         simulate: Optional[str] = None,
         on_level: Optional[Callable[[float, bool], None]] = None,
         realtime: bool = True,
+        on_source: Optional[Callable[[str], None]] = None,
     ):
         self.cfg = cfg
         self.out_q = out_q
         self.simulate = simulate
         self.on_level = on_level
+        self.on_source = on_source  # called when the loopback source switches device
         self.realtime = realtime
         self.stop_event = threading.Event()
         self.finished = threading.Event()
         self.source_name = ""
         self.error: Optional[str] = None
+        self.dropped_sec = 0.0  # loopback audio lost to stalls (should stay 0)
         self._thread: Optional[threading.Thread] = None
         self._segmenter = Segmenter(
             silence_threshold=cfg.silence_threshold,
@@ -366,6 +441,9 @@ class AudioPipeline:
 
     # -- live device -------------------------------------------------------- #
     def _run_device(self) -> None:
+        loopback = parse_loopback(self.cfg.device)
+        if loopback is not None:
+            return self._run_loopback(loopback)
         try:
             sd = _sd()
             idx = find_device(self.cfg.device)
@@ -396,6 +474,90 @@ class AudioPipeline:
                     except queue.Empty:
                         continue
                     self._consume(resampler.process(to_mono(block)))
+        except Exception as e:  # noqa: BLE001 - surface any device error to the UI
+            self.error = f"audio: {e}"
+            log.error("%s", self.error)
+        finally:
+            self._emit(self._segmenter.flush())
+            self.finished.set()
+
+    # -- WASAPI loopback ---------------------------------------------------- #
+    def _run_loopback(self, name_part: str) -> None:
+        """Record what an output device plays (default output when name_part is "").
+
+        WASAPI loopback delivers no packets at all while nothing is playing, so
+        silence is synthesised for those gaps; otherwise the VAD would never see
+        the end of an utterance. While the default device is silent, the stream
+        is reopened every LOOPBACK_RECHECK_SEC to follow a change of default
+        output (headset plugged in, Remote Desktop reconnect).
+        """
+        resampler: Optional[Resampler] = None
+        rate = 0
+        last_activity = time.monotonic()  # last real packet or synthesised silence
+        opened_once = False
+        try:
+            pa = _pa()
+            while not self.stop_event.is_set():
+                p = pa.PyAudio()
+                stream = None
+                try:
+                    info = _pick_loopback(p, name_part)
+                    new_rate = int(info["defaultSampleRate"])
+                    channels = max(1, int(info["maxInputChannels"]))
+                    if new_rate != rate:
+                        rate, resampler = new_rate, Resampler(new_rate, TARGET_RATE)
+                    stream = p.open(format=pa.paFloat32, channels=channels, rate=rate, input=True,
+                                    input_device_index=info["index"],
+                                    frames_per_buffer=int(rate * LOOPBACK_BUFFER_SEC))
+                    if info["name"] != self.source_name:
+                        log.info("recording loopback of %s @ %d Hz, %d ch", info["name"], rate, channels)
+                        changed = bool(self.source_name)
+                        self.source_name = info["name"]
+                        if changed and self.on_source:
+                            self.on_source(self.source_name)
+                    opened_once = True
+                    last_data = time.monotonic()
+                    idle = True  # last thing fed was synthesised silence
+                    while not self.stop_event.is_set():
+                        n = stream.get_read_available()
+                        now = time.monotonic()
+                        if n > 0:
+                            # time not covered by this audio: the silence before playback resumed
+                            # (idle), or audio lost while this thread was stalled. Fill it with zeros
+                            # so stream time keeps tracking wall-clock time.
+                            lead = now - last_activity - n / rate
+                            if idle and lead > 0:
+                                self._consume(resampler.process(np.zeros(int(lead * rate), dtype=np.float32)))
+                            elif lead > LOOPBACK_DROPOUT_SEC:
+                                self.dropped_sec += lead
+                                log.warning("loopback: %.2f s of audio lost (capture thread stalled)", lead)
+                                self._consume(resampler.process(np.zeros(int(lead * rate), dtype=np.float32)))
+                            raw = stream.read(n, exception_on_overflow=False)
+                            block = np.frombuffer(raw, dtype=np.float32).reshape(-1, channels)
+                            self._consume(resampler.process(to_mono(block)))
+                            last_activity = last_data = now
+                            idle = False
+                            continue
+                        gap = now - last_activity
+                        if gap >= LOOPBACK_PAD_SEC:
+                            self._consume(resampler.process(np.zeros(int(gap * rate), dtype=np.float32)))
+                            last_activity = now
+                            idle = True
+                        if not name_part and now - last_data >= LOOPBACK_RECHECK_SEC:
+                            break  # silent for a while: reopen to pick up a new default device
+                        time.sleep(0.01)
+                except Exception as e:  # noqa: BLE001
+                    if not opened_once:
+                        raise  # wrong name / no device at start-up: report it
+                    log.warning("loopback capture interrupted (%s); reopening", e)
+                    self.stop_event.wait(1.0)
+                finally:
+                    if stream is not None:
+                        try:
+                            stream.close()
+                        except Exception:  # noqa: BLE001
+                            pass
+                    p.terminate()
         except Exception as e:  # noqa: BLE001 - surface any device error to the UI
             self.error = f"audio: {e}"
             log.error("%s", self.error)

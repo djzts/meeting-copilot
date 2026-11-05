@@ -1,6 +1,8 @@
 # Python 3.11+
 numpy>=1.24
 sounddevice>=0.4.6
+# Windows: WASAPI loopback capture ([audio] device = "loopback")
+PyAudioWPatch>=0.2.12 ; sys_platform == "win32"
 
 # Speech recognition: pick the backend for your machine
 faster-whisper>=1.0 ; sys_platform != "darwin" or platform_machine != "arm64"
