@@ -75,7 +75,48 @@
   .card .sources .path { color: var(--muted); margin-left: 6px; }
   .card .sources .snip { color: #aeb5c2; font-size: 14px; margin: 2px 0 8px 22px; white-space: pre-wrap; }
   #toast { position: fixed; right: 16px; bottom: 16px; max-width: 560px; background: #3a1d1d; color: #ffd6d6;
-           border: 1px solid #6b2b2b; border-radius: 10px; padding: 10px 14px; font-size: 15px; display: none; }
+           border: 1px solid #6b2b2b; border-radius: 10px; padding: 10px 14px; font-size: 15px; display: none;
+           z-index: 30; white-space: pre-line; }
+  #toast.ok { background: #183325; color: #c9f5da; border-color: #2b6b47; }
+
+  /* ---------- settings drawer ---------- */
+  #setBackdrop { position: fixed; inset: 0; background: rgba(0, 0, 0, .45); display: none; z-index: 10; }
+  #settings { position: fixed; top: 0; right: 0; bottom: 0; width: min(600px, 96vw); z-index: 20;
+              background: var(--panel); border-left: 1px solid var(--border); display: none; flex-direction: column;
+              font-size: 15px; box-shadow: -8px 0 24px rgba(0, 0, 0, .4); }
+  body.settings-open #setBackdrop { display: block; }
+  body.settings-open #settings { display: flex; }
+  #settings .head { display: flex; align-items: center; gap: 10px; padding: 12px 16px; border-bottom: 1px solid var(--border); }
+  #settings .head h2 { margin: 0; font-size: 19px; font-weight: 600; flex: 1; }
+  #settings .scroll { flex: 1; overflow-y: auto; padding: 4px 16px 16px; }
+  #settings h3 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted);
+                 margin: 18px 0 6px; padding-bottom: 4px; border-bottom: 1px solid var(--border); }
+  .fld { padding: 8px 10px; margin: 2px -10px; border-left: 3px solid transparent; border-radius: 6px; }
+  .fld.dirty { border-left-color: var(--accent); background: rgba(108, 182, 255, .06); }
+  .fld.bad { border-left-color: var(--err); background: rgba(255, 107, 107, .08); }
+  .fld .top { display: flex; align-items: baseline; gap: 8px; margin-bottom: 4px; }
+  .fld label { flex: 1; color: var(--text); }
+  .fld .eff { font-size: 12px; color: var(--muted); border: 1px solid var(--border); border-radius: 999px;
+              padding: 0 8px; white-space: nowrap; }
+  .fld .eff.live, .fld .eff.next { color: var(--ok); border-color: #2b6b47; }
+  .fld .eff.claude, .fld .eff.audio, .fld .eff.index { color: var(--q); border-color: #6b5a2b; }
+  .fld .eff.stt, .fld .eff.restart { color: #ffb38a; border-color: #6b432b; }
+  .fld .help { color: var(--muted); font-size: 13px; margin-top: 3px; }
+  .fld .msg { color: var(--err); font-size: 13px; margin-top: 3px; }
+  .fld input[type=text], .fld input[type=number], .fld textarea, .fld select {
+    width: 100%; font: inherit; font-size: 15px; color: var(--text); background: var(--bg);
+    border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; }
+  .fld textarea { resize: vertical; min-height: 64px; }
+  .fld input:focus, .fld textarea:focus, .fld select:focus { outline: none; border-color: var(--accent); }
+  .fld .check { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+  .fld .check input { width: 18px; height: 18px; accent-color: var(--accent); }
+  #settings .foot { display: flex; align-items: center; gap: 10px; padding: 10px 16px; border-top: 1px solid var(--border);
+                    background: var(--panel2); }
+  #settings .foot .where { flex: 1; min-width: 0; color: var(--muted); font-size: 13px; overflow: hidden;
+                           text-overflow: ellipsis; white-space: nowrap; }
+  #settings .foot label { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+  #settings .note { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
+  button:disabled { opacity: .5; cursor: default; }
 </style>
 </head>
 <body>
@@ -89,6 +130,7 @@
   <span class="spacer"></span>
   <button class="primary" id="btnAsk" title="Answer the latest utterance">Answer latest (Space)</button>
   <button id="btnReindex" title="Rebuild the vault index">Rebuild index</button>
+  <button id="btnSettings" title="Change settings while it runs">⚙ Settings</button>
 </header>
 <main>
   <section id="left">
@@ -105,6 +147,20 @@
   </section>
 </main>
 <div id="toast"></div>
+<div id="setBackdrop"></div>
+<aside id="settings" aria-label="Settings">
+  <div class="head">
+    <h2>Settings</h2>
+    <button id="setClose" title="Close (Esc)">✕</button>
+  </div>
+  <div class="scroll" id="setForm"></div>
+  <div class="foot">
+    <span class="where" id="setWhere"></span>
+    <label title="Also write the changes into the config file, so they are used next time"><input type="checkbox" id="setSave" checked> Save to file</label>
+    <button id="setReset" title="Undo your edits in this panel">Reset</button>
+    <button class="primary" id="setApply" disabled>Apply</button>
+  </div>
+</aside>
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
@@ -234,7 +290,8 @@ function renderStatus() {
   $("sttPill").title = `model ${s.stt_model || "?"} on ${s.stt_device || "?"}; lag from end of speech: ${fmtMs(s.stt_lag_ms)}`;
   const cs = s.claude_state || "";
   $("claudeMs").textContent = s.dry_run ? "off (dry run)" : (s.claude_ms != null ? fmtMs(s.claude_ms) : cs || "–");
-  $("claudePill").className = "pill " + (cs === "error" ? "bad" : cs === "answering" ? "warn" : cs === "ready" ? "good" : "");
+  if (["restarting", "warming up", "starting"].includes(cs) && !s.dry_run) $("claudeMs").textContent = cs + "…";
+  $("claudePill").className = "pill " + (cs === "error" ? "bad" : ["answering", "restarting", "warming up"].includes(cs) ? "warn" : cs === "ready" ? "good" : "");
   $("claudePill").title = `state: ${cs}; mode: ${s.claude_mode || "?"}` + (s.last_error ? `\nlast error: ${s.last_error}` : "");
   $("e2eMs").textContent = fmtMs(s.e2e_ms);
   $("e2ePill").className = "pill " + (s.e2e_ms == null ? "" : s.e2e_ms < 8000 ? "good" : "warn");
@@ -259,9 +316,9 @@ function ask(body, el) {
   return post("/ask", body);
 }
 let toastTimer = null;
-function toast(msg) {
+function toast(msg, ok) {
   const t = $("toast");
-  t.textContent = msg; t.style.display = "block";
+  t.textContent = msg; t.style.display = "block"; t.classList.toggle("ok", !!ok);
   clearTimeout(toastTimer); toastTimer = setTimeout(() => (t.style.display = "none"), 8000);
 }
 $("btnAsk").onclick = () => ask({});
@@ -272,12 +329,196 @@ $("askform").onsubmit = (e) => {
   if (v) { ask({ text: v }); $("askInput").value = ""; }
 };
 document.addEventListener("keydown", (e) => {
+  if (settingsOpen()) {
+    if (e.key === "Escape") { e.preventDefault(); closeSettings(); }
+    return;  // no shortcuts while editing settings
+  }
   const tag = (e.target.tagName || "").toLowerCase();
   if (e.code === "Space" && !["input", "textarea", "button", "select"].includes(tag) && !e.target.isContentEditable) {
     e.preventDefault();
     ask({});
   }
 });
+
+// ---------- settings drawer ----------
+let setData = null;                 // GET /config payload
+const setFields = new Map();        // "section.key" -> {f, wrap, get, orig}
+const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+const settingsOpen = () => document.body.classList.contains("settings-open");
+const EFFECT_DONE = {
+  claude: "Claude is restarting (~2 s)", stt: "reloading the speech model (~10 s)", index: "re-indexing the notes",
+  audio: "reopening the audio device", restart: "host / port apply after restarting the app",
+};
+
+async function openSettings() {
+  document.body.classList.add("settings-open");
+  $("setForm").innerHTML = '<p class="note">Loading…</p>';
+  try {
+    const r = await fetch("/config");
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    setData = await r.json();
+  } catch (e) {
+    $("setForm").innerHTML = `<p class="note">Could not load the settings: ${esc(e.message || e)}</p>`;
+    return;
+  }
+  buildSettings();
+}
+function closeSettings(force) {
+  if (!force && dirtyCount() && !confirm("Discard the changes you haven't applied?")) return;
+  document.body.classList.remove("settings-open");
+}
+
+function buildSettings() {
+  const d = setData, form = $("setForm");
+  form.innerHTML = ""; setFields.clear();
+  const bySec = {};
+  for (const f of d.fields) (bySec[f.section] ||= []).push(f);
+  const off = [d.simulate ? "the audio source (playing a WAV file with --simulate)" : "",
+               d.dry_run ? "the Claude settings (Claude is off with --dry-run)" : ""].filter(Boolean);
+  if (off.length) {
+    form.insertAdjacentHTML("beforeend", `<p class="note">Not used in this run: ${off.join("; ")}. Changes to them are still saved for next time.</p>`);
+  }
+  if (d.unsaved && d.unsaved.length) {
+    form.insertAdjacentHTML("beforeend", `<p class="note">Applied but not saved to the file yet: ${esc(d.unsaved.join(", "))}.
+      Tick “Save to file” and click Apply to save them.</p>`);
+  }
+  for (const [sec, title] of Object.entries(d.sections)) {
+    if (!bySec[sec]) continue;
+    const h = document.createElement("h3"); h.textContent = title; form.appendChild(h);
+    for (const f of bySec[sec]) form.appendChild(buildField(f, d.values[f.section][f.key]));
+  }
+  $("setWhere").textContent = "File: " + d.config_path.split(/[\\/]/).pop(); $("setWhere").title = d.config_path;
+  updateDirty();
+}
+
+function buildField(f, value) {
+  const id = `set_${f.section}_${f.key}`;
+  const wrap = document.createElement("div");
+  wrap.className = "fld";
+  const badge = `<span class="eff ${esc(f.effect)}" title="When a change takes effect">${esc(f.effect_label)}</span>`;
+  let input, get, orig = value;
+  if (f.kind === "bool") {
+    wrap.innerHTML = `<div class="top"><label class="check" for="${id}"><input type="checkbox" id="${id}"> ${esc(f.label)}</label>${badge}</div>`;
+    input = wrap.querySelector("input");
+    input.checked = !!value;
+    get = () => input.checked;
+  } else {
+    wrap.innerHTML = `<div class="top"><label for="${id}">${esc(f.label)}</label>${badge}</div>`;
+    if (f.kind === "choice") {
+      input = document.createElement("select");
+      for (const c of f.choices) {
+        const o = document.createElement("option");
+        o.value = c; o.textContent = c === "" ? "(Claude's default)" : c;
+        input.appendChild(o);
+      }
+      input.value = value ?? "";
+      get = () => input.value;
+    } else if (f.kind === "text" || f.kind === "list") {
+      input = document.createElement("textarea");
+      input.rows = f.kind === "list" ? 3 : 2;
+      input.value = f.kind === "list" ? (value || []).join("\n") : (value ?? "");
+      get = f.kind === "list"
+        ? () => input.value.split("\n").map((s) => s.trim()).filter(Boolean)
+        : () => input.value;
+      orig = f.kind === "list" ? (value || []) : (value ?? "");
+    } else {
+      input = document.createElement("input");
+      const num = f.kind === "int" || f.kind === "float";
+      input.type = num ? "number" : "text";
+      if (num) {
+        input.step = f.kind === "int" ? "1" : "any";
+        if (f.min != null) input.min = f.min;
+        if (f.max != null) input.max = f.max;
+      }
+      input.value = value ?? "";
+      if (f.section === "stt" && f.key === "language") input.placeholder = "auto-detect";
+      if (f.section === "vault" && f.key === "name") input.placeholder = "the folder name";
+      if (f.section === "vault" && f.key === "embedding_model") input.placeholder = "none: keyword search only";
+      const opts = (f.section === "audio" && f.key === "device") ? setData.device_options : f.suggest;
+      if (opts && opts.filter(Boolean).length) {
+        const dl = document.createElement("datalist");
+        dl.id = id + "_list";
+        for (const o of opts.filter(Boolean)) { const op = document.createElement("option"); op.value = o; dl.appendChild(op); }
+        wrap.appendChild(dl);
+        input.setAttribute("list", dl.id);
+      }
+      get = num
+        ? () => (input.value.trim() === "" ? input.value : Number(input.value))
+        : () => input.value.trim();
+      orig = num ? value : String(value ?? "").trim();
+    }
+    input.id = id;
+    wrap.appendChild(input);
+  }
+  if (f.help) wrap.insertAdjacentHTML("beforeend", `<div class="help">${esc(f.help)}</div>`);
+  wrap.insertAdjacentHTML("beforeend", `<div class="msg"></div>`);
+  input.addEventListener("input", updateDirty);
+  input.addEventListener("change", updateDirty);
+  setFields.set(`${f.section}.${f.key}`, { f, wrap, get, orig });
+  return wrap;
+}
+
+function dirtyCount() {
+  let n = 0;
+  for (const x of setFields.values()) if (!same(x.get(), x.orig)) n++;
+  return n;
+}
+function updateDirty() {
+  let n = 0;
+  for (const x of setFields.values()) {
+    const dirty = !same(x.get(), x.orig);
+    x.wrap.classList.toggle("dirty", dirty);
+    if (dirty) n++;
+  }
+  const pendingSave = $("setSave").checked && setData && setData.unsaved && setData.unsaved.length;
+  $("setApply").disabled = !(n || pendingSave);
+  $("setApply").textContent = n ? `Apply ${n} change${n > 1 ? "s" : ""}` : (pendingSave ? "Save" : "Apply");
+}
+
+async function applySettings() {
+  const changes = {};
+  for (const x of setFields.values()) {
+    x.wrap.classList.remove("bad"); x.wrap.querySelector(".msg").textContent = "";
+    if (!same(x.get(), x.orig)) (changes[x.f.section] ||= {})[x.f.key] = x.get();
+  }
+  $("setApply").disabled = true;
+  let r, j;
+  try {
+    r = await fetch("/config", { method: "POST", headers: { "Content-Type": "application/json" },
+                                 body: JSON.stringify({ changes, save: $("setSave").checked }) });
+    j = await r.json().catch(() => ({}));
+  } catch (e) {
+    toast("Could not reach meeting-copilot: " + (e.message || e)); updateDirty(); return;
+  }
+  if (!r.ok) {
+    for (const [id, msg] of Object.entries(j.errors || {})) {
+      const x = setFields.get(id);
+      if (x) { x.wrap.classList.add("bad"); x.wrap.querySelector(".msg").textContent = msg; }
+    }
+    toast(j.errors ? "Nothing was changed: fix the fields marked in red." : (j.message || `HTTP ${r.status}`));
+    const firstBad = $("setForm").querySelector(".fld.bad");
+    if (firstBad) firstBad.scrollIntoView({ block: "center", behavior: "smooth" });
+    updateDirty();
+    return;
+  }
+  const lines = [];
+  if (j.changed.length) {
+    const doing = j.effects.map((e) => EFFECT_DONE[e]).filter(Boolean);
+    lines.push(`Applied ${j.changed.length} change${j.changed.length > 1 ? "s" : ""}` + (doing.length ? ": " + doing.join(", ") : "."));
+  }
+  if (j.saved) lines.push("Saved to " + j.saved);
+  else if (j.unsaved && j.unsaved.length) lines.push("Not saved to the file (only for this session).");
+  for (const n of j.notes || []) lines.push(n);
+  toast(lines.join("\n") || "Nothing changed.", true);
+  try { setData = await (await fetch("/config")).json(); buildSettings(); } catch (e) { /* keep the form */ }
+}
+
+$("btnSettings").onclick = openSettings;
+$("setClose").onclick = () => closeSettings();
+$("setBackdrop").onclick = () => closeSettings();
+$("setReset").onclick = () => setData && buildSettings();
+$("setApply").onclick = applySettings;
+$("setSave").onchange = updateDirty;
 
 // ---------- SSE ----------
 function connect() {
@@ -307,6 +548,7 @@ function connect() {
     setTimeout(() => { c.el.remove(); answers.delete(d.id); if (!answers.size) $("emptyMsg").style.display = ""; }, 700);
   });
   on("status", (d) => { Object.assign(status, d); renderStatus(); });
+  on("info", (d) => { Object.assign(info, d); renderStatus(); });
   on("error", (d) => { status.last_error = d.message; toast(d.message); renderStatus(); });
   es.onerror = () => { $("recText").textContent = "Disconnected – retrying…"; };
 }

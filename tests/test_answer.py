@@ -281,3 +281,40 @@ def test_engine_streams_merges_and_skips(vault, monkeypatch):
     eng.stop()
     assert skip["id"] == start["id"] + 1
     assert eng.status()["claude_mode"] == "persistent"
+
+
+def test_engine_restart_uses_new_settings_and_answers_nothing(vault, monkeypatch):
+    tr = Transcript()
+    rec = Recorder()
+    cfg = ClaudeConfig(cli=sys.executable, warmup=True, model="haiku")
+    eng = AnswerEngine(cfg, vault, tr, rec)
+    builders = []
+
+    def make(c, p, e=()):
+        b = fake_builder(c, p, e)
+        builders.append(c.model)
+        return b
+
+    monkeypatch.setattr(answer, "CommandBuilder", make)
+    tr.add(5, "What is the Apollo timeline?")  # the latest line must NOT be answered by a restart
+    eng.start()
+    rec.wait_for("status")
+    deadline = time.time() + 20
+    while eng.state != "ready" and time.time() < deadline:
+        time.sleep(0.05)
+    first_proc = eng.runner.proc
+
+    cfg.model = "sonnet"  # the UI edits the shared ClaudeConfig, then asks for a restart
+    eng.restart()
+    deadline = time.time() + 20
+    while (eng.restarts < 1 or eng.state != "ready") and time.time() < deadline:
+        time.sleep(0.05)
+    assert eng.restarts == 1 and eng.state == "ready"
+    assert builders == ["haiku", "sonnet"]
+    assert eng.runner.proc is not first_proc and first_proc.poll() is not None  # old process ended
+    assert not any(e == "answer_start" for e, _ in rec.events)
+
+    q = tr.add(12, "And how much budget is left?")
+    eng.submit(AskRequest(utt_id=q.id))
+    assert rec.wait_for("answer_end")[0]["ms_first"] is not None  # the new process answers
+    eng.stop()

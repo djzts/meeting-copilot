@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import dataclasses
 import json
 import logging
 import os
@@ -27,6 +28,7 @@ sys.path.insert(0, str(HERE))
 
 import audio  # noqa: E402
 import detector  # noqa: E402
+import settings  # noqa: E402
 import stt  # noqa: E402
 from answer import AnswerEngine, AskRequest, ClaudeConfig  # noqa: E402
 from vault import Vault  # noqa: E402
@@ -70,15 +72,23 @@ def load_config(path: Optional[str]) -> tuple[dict, Optional[Path]]:
             cfg = deep_merge(DEFAULTS, data)
             # a relative vault path is relative to the config file
             vpath = str(cfg["vault"].get("path") or "").strip()
-            if vpath:
-                vp = Path(os.path.expanduser(vpath))
-                if not vp.is_absolute():
-                    vp = (p.resolve().parent / vp).resolve()
-                cfg["vault"]["path"] = str(vp)
+            cfg["vault"]["_path_raw"] = vpath
+            cfg["vault"]["path"] = resolve_vault_path(vpath, p)
             return cfg, p
     if path:
         raise SystemExit(f"config file not found: {path}")
     return copy.deepcopy(DEFAULTS), None
+
+
+def resolve_vault_path(vpath: str, config_path: Optional[Path]) -> str:
+    """A relative vault path is relative to the config file."""
+    vpath = (vpath or "").strip()
+    if not vpath:
+        return ""
+    vp = Path(os.path.expanduser(vpath))
+    if not vp.is_absolute():
+        vp = ((config_path.resolve().parent if config_path else HERE) / vp).resolve()
+    return str(vp)
 
 
 # --------------------------------------------------------------------------- #
@@ -133,6 +143,8 @@ class EventHub:
             self.answers.pop(data.get("id"), None)
         elif event == "status":
             self.status.update(data)
+        elif event == "info":
+            self.info.update(data)
         elif event == "error":
             self.status["last_error"] = data.get("message")
 
@@ -198,6 +210,8 @@ def make_handler(app: "App"):
                 return self._sse()
             if path == "/state":
                 return self._json(200, app.hub.snapshot())
+            if path == "/config":
+                return self._json(200, app.settings_payload())
             return self._json(404, {"error": "not found"})
 
         def do_POST(self):  # noqa: N802
@@ -221,6 +235,14 @@ def make_handler(app: "App"):
             if path == "/reindex":
                 started = app.reindex()
                 return self._json(200, {"ok": True, "started": started})
+            if path == "/config":
+                try:
+                    result = app.apply_settings(data.get("changes", {}), save=bool(data.get("save", True)))
+                except settings.SettingsError as e:
+                    return self._json(400, {"ok": False, "errors": e.errors, "message": str(e)})
+                except OSError as e:
+                    return self._json(500, {"ok": False, "message": f"could not save the config: {e}"})
+                return self._json(200, result)
             return self._json(404, {"error": "not found"})
 
         def _sse(self) -> None:
@@ -260,22 +282,21 @@ class Server(ThreadingHTTPServer):
 # Application
 # --------------------------------------------------------------------------- #
 class App:
-    def __init__(self, cfg: dict, args: argparse.Namespace):
+    def __init__(self, cfg: dict, args: argparse.Namespace, config_path: Optional[Path] = None):
         self.cfg = cfg
         self.args = args
+        self.config_path = config_path
+        self.raw_vault_path = str(cfg["vault"].pop("_path_raw", cfg["vault"].get("path", "")) or "")
         self.stopping = threading.Event()
         self.hub = EventHub()
         self.transcript = stt.Transcript()
-        vcfg = cfg["vault"]
-        self.vault = Vault(
-            vcfg.get("path", ""),
-            exclude=vcfg.get("exclude", []),
-            embedding_model=vcfg.get("embedding_model", ""),
-            top_k=int(vcfg.get("top_k", 6)),
-            per_note=int(vcfg.get("per_note", 2)),
-        )
-        self.vault_name = vcfg.get("name") or self.vault.name
+        self.vault = self._make_vault()
+        self.vault_name = cfg["vault"].get("name") or self.vault.name
         self.claude_cfg = ClaudeConfig.from_dict(cfg["claude"])
+        self.stt_cfg = stt.STTConfig.from_dict(cfg["stt"])  # shared with the transcriber: edits apply live
+        self._stt_reload = threading.Event()
+        self._settings_lock = threading.Lock()
+        self._unsaved: dict[str, dict] = {}  # applied from the UI but not written to the config file
         self.engine = AnswerEngine(self.claude_cfg, self.vault, self.transcript, self.hub.publish,
                                    dry_run=args.dry_run, vault_name=self.vault_name)
         self.seg_q: "queue.Queue[audio.Segment]" = queue.Queue()
@@ -285,6 +306,133 @@ class App:
 
     def status(self, **kw) -> None:
         self.hub.publish("status", kw)
+
+    # -- settings (web UI) ---------------------------------------------------- #
+    def _make_vault(self) -> Vault:
+        vcfg = self.cfg["vault"]
+        return Vault(
+            vcfg.get("path", ""),
+            exclude=vcfg.get("exclude", []),
+            embedding_model=vcfg.get("embedding_model", ""),
+            top_k=int(vcfg.get("top_k", 6)),
+            per_note=int(vcfg.get("per_note", 2)),
+        )
+
+    def _save_target(self) -> Path:
+        """Where UI changes are saved: the loaded config, but never the example template."""
+        p = self.config_path
+        if p is None or p.name == "config.example.toml":
+            return HERE / "config.toml"
+        return p
+
+    def _live_values(self) -> dict:
+        """Current settings; Claude / STT come from the objects the running code uses."""
+        view = {**self.cfg,
+                "claude": {**self.cfg["claude"], **dataclasses.asdict(self.claude_cfg)},
+                "stt": {**self.cfg["stt"], **dataclasses.asdict(self.stt_cfg)}}
+        return settings.current_values(view, self.raw_vault_path)
+
+    def settings_payload(self) -> dict:
+        pipe = self.pipeline
+        loopback_names = None
+        if pipe is not None and not pipe.simulate and not pipe.finished.is_set() \
+                and audio.parse_loopback(pipe.cfg.device) is not None:
+            loopback_names = pipe.loopback_names  # don't re-initialise PortAudio under a live stream
+        return {
+            **settings.schema(),
+            "values": self._live_values(),
+            "unsaved": sorted(f"{s}.{k}" for s, vals in self._unsaved.items() for k in vals),
+            "config_path": str(self._save_target()),
+            "device_options": audio.device_options(loopback_names),
+            "simulate": bool(self.args.simulate),
+            "dry_run": bool(self.args.dry_run),
+        }
+
+    def apply_settings(self, changes: dict, save: bool = True) -> dict:
+        """Apply settings edited in the UI to the running app; optionally save them.
+
+        Raises settings.SettingsError (nothing applied) when a value is invalid.
+        """
+        new = settings.validate_changes(changes)
+        with self._settings_lock:
+            current = self._live_values()
+            diff = {s: {k: v for k, v in vals.items() if current.get(s, {}).get(k) != v}
+                    for s, vals in new.items()}
+            diff = {s: vals for s, vals in diff.items() if vals}
+            for s, vals in diff.items():
+                for k, v in vals.items():
+                    if (s, k) == ("vault", "path"):
+                        self.raw_vault_path = v
+                        self.cfg["vault"]["path"] = resolve_vault_path(v, self.config_path)
+                    else:
+                        self.cfg[s][k] = v
+                    self._unsaved.setdefault(s, {})[k] = v
+            effects = sorted({settings.BY_ID[f"{s}.{k}"].effect for s, vals in diff.items() for k in vals})
+            notes = self._apply_effects(diff)
+            saved = None
+            if save and self._unsaved:
+                saved = str(settings.save_changes(self._save_target(), self._unsaved,
+                                                  template=HERE / "config.example.toml"))
+                self._unsaved = {}
+                log.info("settings saved to %s", saved)
+        changed = [f"{s}.{k}" for s, vals in diff.items() for k in vals]
+        if changed:
+            log.info("settings changed: %s", ", ".join(f"{c}={diff[c.split('.')[0]][c.split('.')[1]]!r}"
+                                                         for c in changed))
+        return {"ok": True, "changed": changed, "effects": effects, "saved": saved, "notes": notes,
+                "unsaved": sorted(f"{s}.{k}" for s, vals in self._unsaved.items() for k in vals)}
+
+    def _apply_effects(self, diff: dict) -> list[str]:
+        notes: list[str] = []
+        restart_claude = False
+
+        c = diff.get("claude", {})
+        for k, v in c.items():
+            setattr(self.claude_cfg, k, v)  # the engine shares this object
+            if settings.BY_ID[f"claude.{k}"].effect == "claude":
+                restart_claude = True
+        if {"auto_answer", "model"} & c.keys():
+            self.hub.publish("info", {"auto_answer": self.claude_cfg.auto_answer, "model": self.claude_cfg.model})
+
+        v = diff.get("vault", {})
+        if {"path", "exclude", "embedding_model"} & v.keys():
+            self.vault = self._make_vault()
+            self.engine.vault = self.vault
+            self.reindex()
+            restart_claude = True  # its readable folder and deny rules come from the vault
+        else:
+            if "top_k" in v:
+                self.vault.top_k = v["top_k"]
+            if "per_note" in v:
+                self.vault.per_note = v["per_note"]
+        name = self.cfg["vault"].get("name") or self.vault.name
+        if name != self.vault_name:
+            self.vault_name = self.engine.vault_name = name
+            self.hub.publish("info", {"vault_name": name})
+
+        s = diff.get("stt", {})
+        for k, val in s.items():
+            setattr(self.stt_cfg, k, val)  # language / initial_prompt are read for every utterance
+        if any(settings.BY_ID[f"stt.{k}"].effect == "stt" for k in s):
+            self._stt_reload.set()
+
+        a = diff.get("audio", {})
+        if "device" in a:
+            if self.args.simulate:
+                notes.append("The audio device is not used while simulating a WAV file.")
+            else:
+                threading.Thread(target=self._restart_audio, name="audio-restart", daemon=True).start()
+        elif a and self.pipeline is not None:
+            self.pipeline.update_vad(audio.AudioConfig.from_dict(self.cfg["audio"]))
+
+        if diff.get("ui"):
+            notes.append("Web UI host / port change after restarting meeting-copilot.")
+        if restart_claude:
+            if self.args.dry_run:
+                notes.append("Claude is off in dry-run mode; the new Claude settings apply on the next normal start.")
+            else:
+                self.engine.restart()
+        return notes
 
     # -- API ---------------------------------------------------------------- #
     def ask(self, utt_id, text) -> tuple[bool, str]:
@@ -313,39 +461,64 @@ class App:
         return True
 
     def _build_index(self) -> None:
-        if not self.vault.root:
-            self.status(index_chunks=0, index_files=0, indexing=False, index_error="no [vault].path configured")
+        v = self.vault
+        if not v.root:
+            self.status(index_chunks=0, index_files=0, indexing=False, vectors=False,
+                        index_error="no [vault].path configured", index_progress=None)
             return
-        self.status(indexing=True)
+        self.status(indexing=True, index_error=None)
+
+        def progress(msg: str) -> None:
+            if v is self.vault:  # a newer vault replaced this one: stay quiet
+                self.status(index_progress=msg, **self._index_stats())
+
         try:
-            self.vault.build(progress=lambda msg: self.status(index_progress=msg, **self._index_stats()))
-            st = self.vault.stats()
-            self.status(indexing=False, index_chunks=st["chunks"], index_files=st["files"],
-                        vectors=st["vectors"], index_error=None, index_progress=None)
+            v.build(progress=progress)
+            if v is self.vault:
+                st = v.stats()
+                self.status(indexing=False, index_chunks=st["chunks"], index_files=st["files"],
+                            vectors=st["vectors"], index_error=None, index_progress=None)
         except Exception as e:  # noqa: BLE001
             log.error("indexing failed: %s", e)
-            self.status(indexing=False, index_error=str(e))
-            self.hub.publish("error", {"message": f"indexing failed: {e}"})
+            if v is self.vault:
+                self.status(indexing=False, index_error=str(e))
+                self.hub.publish("error", {"message": f"indexing failed: {e}"})
 
     def _index_stats(self) -> dict:
         st = self.vault.stats()
         return {"index_chunks": st["chunks"], "index_files": st["files"], "vectors": st["vectors"]}
 
     # -- threads ------------------------------------------------------------ #
-    def _stt_thread(self) -> None:
-        scfg = stt.STTConfig.from_dict(self.cfg["stt"])
-        self.status(stt_state="loading", stt_model=scfg.model)
+    def _load_transcriber(self) -> Optional["stt.Transcriber"]:
+        self.status(stt_state="loading", stt_model=self.stt_cfg.model)
         try:
-            tr = stt.create_transcriber(scfg)
+            tr = stt.create_transcriber(self.stt_cfg)
             tr.warmup()
         except Exception as e:  # noqa: BLE001
             log.exception("could not load speech model")
-            self.status(stt_state="error", recording=False)
+            self.status(stt_state="error")
             self.hub.publish("error", {"message": f"speech model failed to load: {e}"})
+            return None
+        self.status(stt_state="ready", stt_model=self.stt_cfg.model, stt_device=getattr(tr, "device", ""),
+                    stt_backend=tr.name)
+        return tr
+
+    def _stt_thread(self) -> None:
+        tr = self._load_transcriber()
+        if tr is None:
+            self.status(recording=False)
             return
-        self.status(stt_state="ready", stt_device=getattr(tr, "device", ""), stt_backend=tr.name)
         self._start_audio()
         while not self.stopping.is_set():
+            if self._stt_reload.is_set():
+                self._stt_reload.clear()
+                log.info("reloading speech model: %s on %s (%s)", self.stt_cfg.model, self.stt_cfg.device,
+                         self.stt_cfg.compute_type)
+                new = self._load_transcriber()
+                if new is not None:
+                    tr = new
+                else:
+                    self.status(stt_state="ready")  # keep using the previous model
             try:
                 seg = self.seg_q.get(timeout=0.5)
             except queue.Empty:
@@ -376,26 +549,39 @@ class App:
             if u.is_question and self.claude_cfg.auto_answer:
                 self.engine.submit(AskRequest(utt_id=u.id))
 
-    def _start_audio(self) -> None:
+    def _start_audio(self, time_offset: float = 0.0) -> None:
         acfg = audio.AudioConfig.from_dict(self.cfg["audio"])
-        self.pipeline = audio.AudioPipeline(acfg, self.seg_q, simulate=self.args.simulate,
-                                            on_level=self._on_level,
-                                            on_source=lambda name: self.status(source=name))
-        self.pipeline.start()
+        pipe = audio.AudioPipeline(acfg, self.seg_q, simulate=self.args.simulate,
+                                   on_level=self._on_level,
+                                   on_source=lambda name: self.status(source=name),
+                                   time_offset=time_offset)
+        self.pipeline = pipe
+        pipe.start()
 
         def watch():
             # report the source once it is open, and errors / end of simulation
             for _ in range(50):
-                if self.pipeline.source_name or self.pipeline.finished.is_set():
+                if pipe.source_name or pipe.finished.is_set():
                     break
                 time.sleep(0.1)
-            self.status(recording=not self.pipeline.finished.is_set(), source=self.pipeline.source_name)
-            self.pipeline.finished.wait()
-            self.status(recording=False, level=0, speaking=False)
-            if self.pipeline.error:
-                self.hub.publish("error", {"message": self.pipeline.error})
+            if pipe is self.pipeline:
+                self.status(recording=not pipe.finished.is_set(), source=pipe.source_name)
+            pipe.finished.wait()
+            if pipe is self.pipeline:  # not when it was replaced by a reopened device
+                self.status(recording=False, level=0, speaking=False)
+            if pipe.error:
+                self.hub.publish("error", {"message": pipe.error})
 
         threading.Thread(target=watch, name="audio-watch", daemon=True).start()
+
+    def _restart_audio(self) -> None:
+        old = self.pipeline
+        if old is None:  # not started yet (speech model still loading): it will use the new cfg
+            return
+        old.stop()
+        old.finished.wait(5)
+        log.info("reopening audio: %s", self.cfg["audio"]["device"])
+        self._start_audio(time_offset=old.stream_time)
 
     def _on_level(self, level: float, speaking: bool) -> None:
         self.hub.publish("status", {"level": round(level, 4), "speaking": speaking})
@@ -410,6 +596,7 @@ class App:
             "simulate": self.args.simulate,
             "auto_answer": self.claude_cfg.auto_answer,
             "model": self.claude_cfg.model,
+            "config_path": str(self._save_target()),
         }
         self.hub.status.update({"recording": False, "dry_run": self.args.dry_run,
                                 "claude_state": "dry-run" if self.args.dry_run else "starting"})
@@ -486,7 +673,7 @@ def main(argv=None) -> int:
         print("[audio].device is empty. Pick a device and put part of its name in the config.\n")
         print(audio.list_devices())
         return 0
-    App(cfg, args).run()
+    App(cfg, args, config_path=path).run()
     return 0
 
 

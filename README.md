@@ -161,6 +161,21 @@ Open <http://127.0.0.1:8765/> on your second screen (`--open` does that for you)
 - **Right**: answer cards, newest on top. Each card shows the question, the streamed answer and its sources.
   The `[n]` citations and source titles are `obsidian://open?vault=…&file=…` links.
 - **Space**: answer the latest utterance. **Rebuild index**: re-scan the vault after you edit notes.
+- **⚙ Settings**: change the configuration while it runs. Each field shows when a change takes effect:
+  | badge | settings |
+  |---|---|
+  | instant | auto-answer, about me, transcript context, notes per question, sections per note, vault name |
+  | next utterance | speech threshold, end-of-speech silence, segment lengths, pre-roll, Whisper language, names and jargon |
+  | restarts Claude (~2 s) | model, effort, extended thinking, vault tools, process mode, timeouts, CLI path |
+  | re-indexes notes | notes folder, exclude globs, embedding model (Claude is restarted too, for its folder and deny rules) |
+  | reloads speech model (~10 s) | Whisper model, backend, device, precision; transcription continues with the old model until the new one is ready |
+  | reopens audio | audio source; transcript timestamps continue |
+  | after restarting the app | web UI host and port |
+
+  **Save to file** (on by default) writes the changes into the config file that was loaded. Only the edited lines
+  change; comments and everything else stay as they were. If meeting-copilot was started with `config.example.toml`,
+  the changes go to `config.toml` instead, so the template stays clean. Untick it to try a change for this session only.
+  Invalid values are rejected and nothing is changed.
 - **Status bar**: recording state and input level, Whisper time per segment, Claude time to first token,
   time from end of speech to first answer text, and the number of indexed chunks.
 
@@ -287,6 +302,7 @@ audio.py             capture, resample to 16 kHz, silence-based segmentation
 stt.py               Whisper backends (faster-whisper / mlx) + hallucination filter
 detector.py          rule-based question detection (English + Chinese)
 vault.py             Obsidian indexing: BM25 + optional embeddings, RRF fusion
+settings.py          settings editable from the UI: schema, validation, comment-preserving config.toml writer
 answer.py            persistent claude process, prompt building, stream parsing, SKIP
 ui.html              single-file UI
 config.example.toml  configuration template

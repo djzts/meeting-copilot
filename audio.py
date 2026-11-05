@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import logging
 import queue
+import re
+import sys
 import threading
 import time
 import wave
@@ -134,11 +136,8 @@ class Segmenter:
         self.rate = rate
         self.frame_len = int(round(rate * frame_sec))
         self.frame_sec = self.frame_len / rate
-        self.threshold = silence_threshold
-        self.end_silence_frames = max(1, int(round(end_silence_sec / self.frame_sec)))
-        self.max_frames = max(1, int(round(max_segment_sec / self.frame_sec)))
-        self.min_voiced_sec = min_segment_sec
-        self.preroll = deque(maxlen=max(0, int(round(preroll_sec / self.frame_sec))))
+        self.preroll: deque = deque(maxlen=0)
+        self.configure(silence_threshold, end_silence_sec, max_segment_sec, min_segment_sec, preroll_sec)
         self._pending = np.zeros(0, dtype=np.float32)
         self._frame_index = 0  # index of the next frame to be processed
         self._seg: Optional[list[np.ndarray]] = None
@@ -147,6 +146,15 @@ class Segmenter:
         self._last_voiced = 0
         self._silent_run = 0
         self.last_level = 0.0
+
+    def configure(self, silence_threshold: float, end_silence_sec: float, max_segment_sec: float,
+                  min_segment_sec: float, preroll_sec: float) -> None:
+        """(Re)set the VAD parameters; safe to call between feed() calls."""
+        self.threshold = silence_threshold
+        self.end_silence_frames = max(1, int(round(end_silence_sec / self.frame_sec)))
+        self.max_frames = max(1, int(round(max_segment_sec / self.frame_sec)))
+        self.min_voiced_sec = min_segment_sec
+        self.preroll = deque(self.preroll, maxlen=max(0, int(round(preroll_sec / self.frame_sec))))
 
     @property
     def stream_time(self) -> float:
@@ -299,6 +307,7 @@ LOOPBACK_RECHECK_SEC = 5.0  # silent this long -> reopen, in case the default ou
 # ~0.5 s and dropped audio with the default 0.1 s buffer). Reads still arrive every ~10 ms.
 LOOPBACK_BUFFER_SEC = 1.0
 LOOPBACK_DROPOUT_SEC = 0.15  # more wall-clock time passed than audio arrived: count it as lost
+_PA_LOCK = threading.Lock()  # PortAudio init/terminate from several threads must not overlap
 
 
 def _pa():
@@ -359,6 +368,40 @@ def _loopback_table() -> list[str]:
         p.terminate()
 
 
+def device_options(loopback_names: Optional[list[str]] = None) -> list[str]:
+    """Values that can go into [audio].device, for the settings UI.
+
+    Pass the names a running loopback pipeline already saw: PortAudio must not be
+    re-initialised from another thread while that pipeline uses it.
+    """
+    opts: list[str] = []
+    names = loopback_names
+    if names is None and sys.platform == "win32":
+        try:
+            pa = _pa()
+            with _PA_LOCK:
+                p = pa.PyAudio()
+                try:
+                    names = [d["name"] for d in p.get_loopback_device_info_generator()]
+                finally:
+                    p.terminate()
+        except Exception:  # noqa: BLE001 - PyAudioWPatch missing or no devices
+            names = []
+    if sys.platform == "win32":
+        opts.append("loopback")
+        opts += ["loopback:" + re.sub(r"\s*\[Loopback\]$", "", n) for n in names or []]
+    try:
+        sd = _sd()
+        seen = set()
+        for d in sd.query_devices():
+            if d["max_input_channels"] > 0 and d["name"] not in seen:
+                seen.add(d["name"])
+                opts.append(d["name"])
+    except Exception:  # noqa: BLE001
+        pass
+    return opts
+
+
 # --------------------------------------------------------------------------- #
 # Pipeline (one thread per source)
 # --------------------------------------------------------------------------- #
@@ -389,8 +432,13 @@ class AudioPipeline:
         on_level: Optional[Callable[[float, bool], None]] = None,
         realtime: bool = True,
         on_source: Optional[Callable[[str], None]] = None,
+        time_offset: float = 0.0,
     ):
         self.cfg = cfg
+        # added to segment times, so a reopened device continues the transcript's clock
+        self.time_offset = time_offset
+        self._pending_cfg: Optional[AudioConfig] = None
+        self.loopback_names: list[str] = []  # output devices seen by the loopback source
         self.out_q = out_q
         self.simulate = simulate
         self.on_level = on_level
@@ -419,8 +467,22 @@ class AudioPipeline:
     def stop(self) -> None:
         self.stop_event.set()
 
+    @property
+    def stream_time(self) -> float:
+        """Transcript time of the audio consumed so far (includes time_offset)."""
+        return self.time_offset + self._segmenter.stream_time
+
+    def update_vad(self, cfg: AudioConfig) -> None:
+        """Change the VAD parameters; applied by the audio thread before its next block."""
+        self._pending_cfg = cfg
+
     # -- shared processing -------------------------------------------------- #
     def _consume(self, mono16k: np.ndarray) -> None:
+        pending, self._pending_cfg = self._pending_cfg, None
+        if pending is not None:
+            self.cfg = pending
+            self._segmenter.configure(pending.silence_threshold, pending.end_silence_sec,
+                                      pending.max_segment_sec, pending.min_segment_sec, pending.preroll_sec)
         segs = self._segmenter.feed(mono16k)
         self._emit(segs)
         now = time.time()
@@ -436,6 +498,8 @@ class AudioPipeline:
         for s in segs:
             s.wall_ready = now
             s.wall_end = now - max(0.0, stream_now - s.t_end)
+            s.t_start += self.time_offset
+            s.t_end += self.time_offset
             log.debug("segment %.2f-%.2f (%.2fs)", s.t_start, s.t_end, s.duration)
             self.out_q.put(s)
 
@@ -498,9 +562,11 @@ class AudioPipeline:
         try:
             pa = _pa()
             while not self.stop_event.is_set():
-                p = pa.PyAudio()
+                with _PA_LOCK:
+                    p = pa.PyAudio()
                 stream = None
                 try:
+                    self.loopback_names = [d["name"] for d in p.get_loopback_device_info_generator()]
                     info = _pick_loopback(p, name_part)
                     new_rate = int(info["defaultSampleRate"])
                     channels = max(1, int(info["maxInputChannels"]))
@@ -557,7 +623,8 @@ class AudioPipeline:
                             stream.close()
                         except Exception:  # noqa: BLE001
                             pass
-                    p.terminate()
+                    with _PA_LOCK:
+                        p.terminate()
         except Exception as e:  # noqa: BLE001 - surface any device error to the UI
             self.error = f"audio: {e}"
             log.error("%s", self.error)

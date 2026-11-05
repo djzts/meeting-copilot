@@ -645,6 +645,7 @@ class AskRequest:
     utt_id: Optional[int] = None
     text: Optional[str] = None
     manual: bool = False
+    wake: bool = False  # internal: wakes the worker (stop / restart), answers nothing
 
 
 class AnswerEngine:
@@ -666,6 +667,8 @@ class AnswerEngine:
         self.q: "queue.Queue[AskRequest]" = queue.Queue()
         self._next_id = 1
         self._stop = threading.Event()
+        self._restart = threading.Event()
+        self.restarts = 0
         self.runner = None
         self.state = "dry-run" if dry_run else "starting"
         self.last_ms_first: Optional[int] = None
@@ -677,12 +680,22 @@ class AnswerEngine:
 
     def stop(self) -> None:
         self._stop.set()
-        self.q.put(AskRequest())  # wake up
+        self.q.put(AskRequest(wake=True))
         if self.runner:
             self.runner.stop()
 
     def submit(self, req: AskRequest) -> None:
         self.q.put(req)
+
+    def restart(self) -> None:
+        """Start a fresh claude process with the current cfg (model, flags, vault).
+
+        Runs in the worker thread, after the answer in progress (if any) finishes.
+        """
+        if self.dry_run:
+            return
+        self._restart.set()
+        self.q.put(AskRequest(wake=True))
 
     def status(self) -> dict:
         return {
@@ -721,19 +734,33 @@ class AnswerEngine:
             log.info("claude ready (warm-up %d ms)", turn.ms_total or 0)
             self._set_state("ready")
 
+    def _start_runner(self) -> None:
+        try:
+            self.runner = self._make_runner()
+            if self.runner.mode == "persistent":
+                self.runner.start()
+            self._warmup()
+            if self.state not in ("error",):
+                self._set_state("ready")
+        except Exception as e:  # noqa: BLE001
+            self.runner = None
+            self._set_state("error")
+            self.emit("error", {"message": f"could not start claude: {e}"})
+            log.exception("could not start claude")
+
+    def _restart_runner(self) -> None:
+        log.info("restarting claude (model %s, effort %s, thinking %s)",
+                 self.cfg.model, self.cfg.effort or "default", self.cfg.thinking)
+        self._set_state("restarting")
+        if self.runner is not None:
+            self.runner.stop()
+            self.runner = None
+        self.restarts += 1
+        self._start_runner()
+
     def _run(self) -> None:
         if not self.dry_run:
-            try:
-                self.runner = self._make_runner()
-                if self.runner.mode == "persistent":
-                    self.runner.start()
-                self._warmup()
-                if self.state not in ("error",):
-                    self._set_state("ready")
-            except Exception as e:  # noqa: BLE001
-                self._set_state("error")
-                self.emit("error", {"message": f"could not start claude: {e}"})
-                log.exception("could not start claude")
+            self._start_runner()
         while not self._stop.is_set():
             req = self.q.get()
             if self._stop.is_set():
@@ -744,6 +771,12 @@ class AnswerEngine:
                     batch.append(self.q.get_nowait())
                 except queue.Empty:
                     break
+            if self._restart.is_set():
+                self._restart.clear()
+                self._restart_runner()
+            batch = [r for r in batch if not r.wake]
+            if not batch:
+                continue
             try:
                 self._answer(batch)
             except Exception as e:  # noqa: BLE001
