@@ -1,0 +1,52 @@
+# meeting-copilot configuration. Copy to config.toml and edit.
+
+[audio]
+# Part of the input device name. Leave empty to list all devices and exit.
+#   Windows: "CABLE Output" (VB-Audio Virtual Cable) or "Stereo Mix"
+#   macOS:   "BlackHole"
+device = ""
+silence_threshold = 0.01   # RMS of a 30 ms frame above this counts as speech
+end_silence_sec = 0.8      # cut a segment after this much silence
+max_segment_sec = 20       # ...or when it gets this long
+min_segment_sec = 0.6      # drop blips shorter than this
+preroll_sec = 0.3          # audio kept before speech starts
+
+[stt]
+backend = "faster-whisper"   # "faster-whisper" (Windows/Linux/NVIDIA) or "mlx" (Apple Silicon)
+# faster-whisper: "large-v3-turbo" (GPU), "small" (CPU only)
+# mlx:            "mlx-community/whisper-large-v3-turbo"
+model = "large-v3-turbo"
+language = ""                # "" = auto-detect, "en", "zh", ...
+device = "auto"              # auto | cuda | cpu   (faster-whisper only)
+compute_type = "int8"        # int8 | int8_float16 | float16 | float32
+# Domain terms that help Whisper spell names / jargon correctly
+initial_prompt = ""
+
+[vault]
+path = ""                    # e.g. "C:/Users/me/Obsidian/MyVault" or "~/Documents/Vault"
+name = ""                    # vault name for obsidian:// links (default: folder name)
+exclude = []                 # globs relative to the vault, e.g. ["NDA/**", "Private/**", "*.excalidraw.md"]
+# Optional local semantic search (sentence-transformers). "" = BM25 only.
+# For better multilingual quality use "BAAI/bge-m3" (bigger and slower).
+embedding_model = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+top_k = 6                    # notes sent to Claude per question
+per_note = 2                 # max sections taken from a single note
+
+[claude]
+cli = "claude"               # path to the Claude Code CLI
+model = "haiku"              # haiku is fastest; "sonnet" for better answers
+context_minutes = 3          # how much recent transcript to include
+auto_answer = true           # answer detected questions automatically
+allow_vault_tools = true     # let Claude Read/Grep/Glob the vault when the notes are not enough
+about_me = ""                # who you are / your role, so answers sound like you
+# Advanced
+mode = "auto"                # auto | persistent | oneshot
+session_max_minutes = 30     # restart the persistent session after this long (keeps it fast)
+warmup = true                # send a tiny warm-up turn at start-up (checks login, primes the cache)
+effort = "low"               # "", "low", "medium", "high": passed as --effort when set
+thinking = false             # extended thinking: better reasoning, but ~5-10 s before the first word
+turn_timeout_sec = 90
+
+[ui]
+host = "127.0.0.1"
+port = 8765

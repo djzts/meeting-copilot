@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.cache/
+config.toml
+*.wav
+!tests/fixtures/*.wav
+.venv/

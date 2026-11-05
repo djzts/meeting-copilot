@@ -1,0 +1,34 @@
+# Config for the demo / acceptance run against the fake vault in tests/fixtures/vault.
+#   python tests/make_demo_wav.py demo_meeting.wav
+#   python copilot.py --config tests/demo_config.toml --simulate demo_meeting.wav --dry-run
+
+[audio]
+device = ""
+
+[stt]
+backend = "faster-whisper"
+model = "large-v3-turbo"
+language = "en"
+device = "auto"
+compute_type = "int8"
+initial_prompt = "Apollo migration, cut-over, PostgreSQL, reconciliation, p95 latency."
+
+[vault]
+path = "fixtures/vault"
+name = "vault"
+exclude = ["NDA/**"]
+embedding_model = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+top_k = 6
+per_note = 2
+
+[claude]
+cli = "claude"
+model = "haiku"
+context_minutes = 3
+auto_answer = true
+allow_vault_tools = true
+about_me = "I am the tech lead of the data platform team."
+
+[ui]
+host = "127.0.0.1"
+port = 8765

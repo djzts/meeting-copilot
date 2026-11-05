@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Meeting Copilot</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #161a21; --panel2: #1c212a; --border: #2a303b;
+    --text: #e6e9ef; --muted: #8b93a3; --accent: #6cb6ff; --q: #f2c94c; --qbg: rgba(242, 201, 76, .10);
+    --ok: #4cd681; --err: #ff6b6b; --rec: #ff4d4d;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 19px/1.5 "Segoe UI", system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  header {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 8px 14px; background: var(--panel); border-bottom: 1px solid var(--border); font-size: 15px;
+  }
+  .pill { padding: 3px 10px; border-radius: 999px; background: var(--panel2); border: 1px solid var(--border);
+          color: var(--muted); white-space: nowrap; }
+  .pill b { color: var(--text); font-weight: 600; }
+  .pill.warn b { color: var(--q); } .pill.bad b { color: var(--err); } .pill.good b { color: var(--ok); }
+  #rec .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: #555; margin-right: 6px; }
+  #rec.on .dot { background: var(--rec); box-shadow: 0 0 8px var(--rec); }
+  #rec.on.speaking .dot { animation: pulse .6s infinite alternate; }
+  @keyframes pulse { to { transform: scale(1.35); } }
+  #meter { display: inline-block; width: 60px; height: 6px; background: #2a2f38; border-radius: 3px; vertical-align: middle; margin-left: 6px; overflow: hidden; }
+  #meter i { display: block; height: 100%; width: 0; background: var(--ok); transition: width .3s; }
+  .spacer { flex: 1; }
+  button { font: inherit; font-size: 15px; color: var(--text); background: var(--panel2); border: 1px solid var(--border);
+           border-radius: 8px; padding: 5px 12px; cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: #1f3b57; border-color: #2f5b85; }
+  main { flex: 1; display: flex; min-height: 0; }
+  #left { width: 30%; min-width: 260px; display: flex; flex-direction: column; border-right: 1px solid var(--border); }
+  #transcript { flex: 1; overflow-y: auto; padding: 10px 12px; font-size: 17px; }
+  .utt { padding: 6px 8px; margin: 2px 0; border-radius: 6px; cursor: pointer; border-left: 3px solid transparent; }
+  .utt:hover { background: var(--panel2); }
+  .utt .ts { color: var(--muted); font-size: 13px; margin-right: 6px; font-variant-numeric: tabular-nums; }
+  .utt.q { background: var(--qbg); border-left-color: var(--q); }
+  .utt.q .txt { color: #fff3c4; }
+  .utt.asked { outline: 1px dashed var(--accent); }
+  #askform { display: flex; gap: 6px; padding: 8px; border-top: 1px solid var(--border); background: var(--panel); }
+  #askform input { flex: 1; font: inherit; font-size: 16px; color: var(--text); background: var(--bg);
+                   border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; }
+  #right { flex: 1; overflow-y: auto; padding: 14px 18px; }
+  .empty { color: var(--muted); text-align: center; margin-top: 18vh; font-size: 20px; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 14px 18px;
+          margin-bottom: 14px; transition: opacity .6s; }
+  .card:first-child { border-color: #35506b; box-shadow: 0 0 0 1px #24384d; }
+  .card .qs { color: var(--q); font-size: 17px; margin-bottom: 8px; }
+  .card .qs .ts { color: var(--muted); font-size: 13px; margin-right: 6px; }
+  .card .qs .tag { font-size: 12px; color: var(--muted); border: 1px solid var(--border); border-radius: 4px; padding: 0 5px; margin-left: 6px; }
+  .card .body { font-size: 25px; line-height: 1.45; }
+  .card .body ul, .card .body ol { margin: 6px 0 2px; padding-left: 1.2em; }
+  .card .body li { margin: 3px 0; }
+  .card .body p { margin: 0 0 6px; }
+  .card .body strong { color: #fff; }
+  .card .body code { background: var(--panel2); padding: 0 4px; border-radius: 4px; font-size: .85em; }
+  .card .body sup a { color: var(--accent); text-decoration: none; font-size: .7em; }
+  .card.streaming .body::after { content: "▍"; color: var(--accent); animation: blink 1s steps(1) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  .card .meta { color: var(--muted); font-size: 13px; margin-top: 8px; }
+  .card .meta .err { color: var(--err); }
+  .card.skipped { opacity: 0; }
+  .card .sources { margin: 10px 0 0; padding: 8px 0 0; border-top: 1px solid var(--border); list-style: none; font-size: 14px; }
+  .card .sources li { margin: 2px 0; }
+  .card .sources a { color: var(--accent); text-decoration: none; }
+  .card .sources a:hover { text-decoration: underline; }
+  .card .sources .path { color: var(--muted); margin-left: 6px; }
+  .card .sources .snip { color: #aeb5c2; font-size: 14px; margin: 2px 0 8px 22px; white-space: pre-wrap; }
+  #toast { position: fixed; right: 16px; bottom: 16px; max-width: 560px; background: #3a1d1d; color: #ffd6d6;
+           border: 1px solid #6b2b2b; border-radius: 10px; padding: 10px 14px; font-size: 15px; display: none; }
+</style>
+</head>
+<body>
+<header>
+  <span class="pill" id="rec"><span class="dot"></span><b id="recText">Idle</b><span id="meter"><i></i></span></span>
+  <span class="pill" id="sttPill">STT <b id="sttMs">–</b></span>
+  <span class="pill" id="claudePill">Claude <b id="claudeMs">–</b></span>
+  <span class="pill" id="e2ePill">speech→text on screen <b id="e2eMs">–</b></span>
+  <span class="pill" id="indexPill">Index <b id="indexTxt">–</b></span>
+  <span class="pill" id="modePill"><b id="modeTxt">–</b></span>
+  <span class="spacer"></span>
+  <button class="primary" id="btnAsk" title="Answer the latest utterance">Answer latest (Space)</button>
+  <button id="btnReindex" title="Rebuild the vault index">Rebuild index</button>
+</header>
+<main>
+  <section id="left">
+    <div id="transcript"></div>
+    <form id="askform" autocomplete="off">
+      <input id="askInput" placeholder="Type a question to answer…">
+      <button type="submit">Ask</button>
+    </form>
+  </section>
+  <section id="right">
+    <div id="answers"></div>
+    <div class="empty" id="emptyMsg">Answers appear here when someone asks a question.<br>
+      <span style="font-size:15px">Click a line on the left or press Space to answer the latest one.</span></div>
+  </section>
+</main>
+<div id="toast"></div>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const transcriptEl = $("transcript"), answersEl = $("answers");
+const answers = new Map();   // id -> {data, el, text}
+let info = {};
+const MAX_CARDS = 30;
+
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+function ts(t) {
+  if (t === null || t === undefined) return "";
+  t = Math.max(0, Math.floor(t));
+  return String(Math.floor(t / 60)).padStart(2, "0") + ":" + String(t % 60).padStart(2, "0");
+}
+function fmtMs(ms) {
+  if (ms === null || ms === undefined) return "–";
+  return ms >= 1000 ? (ms / 1000).toFixed(1) + " s" : ms + " ms";
+}
+
+// ---------- minimal markdown: bold, italic, code, bullets, numbered lists, [n] citations ----------
+function inline(s, sources) {
+  s = esc(s);
+  s = s.replace(/`([^`]+)`/g, "<code>$1</code>");
+  s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>").replace(/__([^_]+)__/g, "<strong>$1</strong>");
+  s = s.replace(/(^|[^*\w])\*([^*\s][^*]*?)\*(?!\*)/g, "$1<em>$2</em>");
+  s = s.replace(/\[(\d+(?:\s*[,，]\s*\d+)*)\]/g, (m, nums) =>
+    nums.split(/\s*[,，]\s*/).map((n) => {
+      const src = (sources || []).find((x) => String(x.n) === n);
+      return src ? `<sup><a href="${esc(src.url)}" title="${esc(src.title)}">[${n}]</a></sup>` : `<sup>[${n}]</sup>`;
+    }).join(""));
+  return s;
+}
+function renderMarkdown(text, sources) {
+  const lines = String(text || "").replace(/\r/g, "").split("\n");
+  let html = "", list = null;
+  const close = () => { if (list) { html += `</${list}>`; list = null; } };
+  for (const raw of lines) {
+    const line = raw.trimEnd();
+    let m;
+    if ((m = line.match(/^\s*(?:[-*•·]|•)\s+(.*)$/))) {
+      if (list !== "ul") { close(); html += "<ul>"; list = "ul"; }
+      html += `<li>${inline(m[1], sources)}</li>`;
+    } else if ((m = line.match(/^\s*\d+[.)、]\s+(.*)$/))) {
+      if (list !== "ol") { close(); html += "<ol>"; list = "ol"; }
+      html += `<li>${inline(m[1], sources)}</li>`;
+    } else if (!line.trim()) {
+      close();
+    } else {
+      close();
+      html += `<p>${inline(line.replace(/^#+\s*/, ""), sources)}</p>`;
+    }
+  }
+  close();
+  return html;
+}
+
+// ---------- transcript ----------
+function addUtt(u) {
+  const nearBottom = transcriptEl.scrollHeight - transcriptEl.scrollTop - transcriptEl.clientHeight < 80;
+  const div = document.createElement("div");
+  div.className = "utt" + (u.is_question ? " q" : "");
+  div.dataset.id = u.id;
+  div.title = "Click to answer this line";
+  div.innerHTML = `<span class="ts">${ts(u.t)}</span><span class="txt">${esc(u.text)}</span>`;
+  div.onclick = () => ask({ utt_id: u.id }, div);
+  transcriptEl.appendChild(div);
+  while (transcriptEl.children.length > 1000) transcriptEl.removeChild(transcriptEl.firstChild);
+  if (nearBottom) transcriptEl.scrollTop = transcriptEl.scrollHeight;
+}
+
+// ---------- answer cards ----------
+function cardFor(id) { return answers.get(id); }
+function newCard(d) {
+  $("emptyMsg").style.display = "none";
+  const el = document.createElement("div");
+  el.className = "card" + (d.state === "done" || d.state === "error" || d.dry_run ? "" : " streaming");
+  const qs = (d.questions || []).map((q) =>
+    `<div><span class="ts">${ts(q.t)}</span>${esc(q.text)}${d.manual ? '<span class="tag">manual</span>' : ""}</div>`).join("");
+  const srcs = (d.sources || []).map((s) =>
+    `<li><a href="${esc(s.url)}">[${s.n}] ${esc(s.title)}</a><span class="path">${esc(s.path)}</span>` +
+    (d.dry_run ? `<div class="snip">${esc(s.snippet)}${s.snippet && s.snippet.length >= 280 ? "…" : ""}</div>` : "") + `</li>`).join("");
+  el.innerHTML = `<div class="qs">${qs}</div><div class="body"></div><div class="meta"></div>` +
+    (srcs ? `<ol class="sources">${srcs}</ol>` : `<div class="meta">No matching notes.</div>`);
+  answersEl.prepend(el);
+  const entry = { data: d, el, text: d.text || "" };
+  answers.set(d.id, entry);
+  while (answersEl.children.length > MAX_CARDS) {
+    const last = answersEl.lastElementChild;
+    for (const [k, v] of answers) if (v.el === last) answers.delete(k);
+    last.remove();
+  }
+  renderBody(entry);
+  if (d.dry_run) entry.el.querySelector(".meta").textContent = "dry run: Claude not called; retrieved notes shown below";
+  return entry;
+}
+function renderBody(entry) {
+  entry.el.querySelector(".body").innerHTML = renderMarkdown(entry.text, entry.data.sources);
+}
+function finishCard(entry, d) {
+  entry.el.classList.remove("streaming");
+  const meta = entry.el.querySelector(".meta");
+  if (d.error) { meta.innerHTML = `<span class="err">${esc(d.error)}</span>`; return; }
+  if (d.dry_run) return;
+  const parts = [];
+  if (d.ms_first != null) parts.push(`first token ${fmtMs(d.ms_first)}`);
+  if (d.ms_total != null) parts.push(`total ${fmtMs(d.ms_total)}`);
+  if (d.e2e_ms != null) parts.push(`speech end → text ${fmtMs(d.e2e_ms)}`);
+  if (d.tools && d.tools.length) parts.push(`searched vault (${d.tools.join(", ")})`);
+  meta.textContent = parts.join(" · ");
+}
+
+// ---------- status bar ----------
+let status = {};
+function renderStatus() {
+  const s = status;
+  const rec = $("rec");
+  rec.classList.toggle("on", !!s.recording);
+  rec.classList.toggle("speaking", !!s.speaking);
+  let recText = s.recording ? "Recording" : (s.stt_state === "loading" ? "Loading speech model…" : "Idle");
+  if (s.stt_state === "error") recText = "Speech model error";
+  $("recText").textContent = recText;
+  rec.title = s.source || "";
+  $("meter").firstElementChild.style.width = Math.min(100, Math.sqrt(s.level || 0) * 400) + "%";
+  $("sttMs").textContent = fmtMs(s.stt_ms);
+  $("sttPill").title = `model ${s.stt_model || "?"} on ${s.stt_device || "?"}; lag from end of speech: ${fmtMs(s.stt_lag_ms)}`;
+  const cs = s.claude_state || "";
+  $("claudeMs").textContent = s.dry_run ? "off (dry run)" : (s.claude_ms != null ? fmtMs(s.claude_ms) : cs || "–");
+  $("claudePill").className = "pill " + (cs === "error" ? "bad" : cs === "answering" ? "warn" : cs === "ready" ? "good" : "");
+  $("claudePill").title = `state: ${cs}; mode: ${s.claude_mode || "?"}` + (s.last_error ? `\nlast error: ${s.last_error}` : "");
+  $("e2eMs").textContent = fmtMs(s.e2e_ms);
+  $("e2ePill").className = "pill " + (s.e2e_ms == null ? "" : s.e2e_ms < 8000 ? "good" : "warn");
+  let idx = s.indexing ? "building…" : (s.index_chunks != null ? `${s.index_chunks} chunks` : "–");
+  if (s.index_error) idx = "error";
+  $("indexTxt").textContent = idx;
+  $("indexPill").title = s.index_error || `${s.index_files || 0} notes` + (s.vectors ? " · BM25 + vectors" : " · BM25");
+  $("indexPill").className = "pill " + (s.index_error ? "bad" : "");
+  $("modeTxt").textContent = [s.dry_run ? "DRY RUN" : null, info.simulate ? "SIMULATE" : null,
+    info.auto_answer === false ? "manual only" : "auto-answer"].filter(Boolean).join(" · ");
+}
+
+// ---------- actions ----------
+async function post(path, body) {
+  const r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) toast(j.message || j.error || `HTTP ${r.status}`);
+  return j;
+}
+function ask(body, el) {
+  if (el) { el.classList.add("asked"); setTimeout(() => el.classList.remove("asked"), 1500); }
+  return post("/ask", body);
+}
+let toastTimer = null;
+function toast(msg) {
+  const t = $("toast");
+  t.textContent = msg; t.style.display = "block";
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => (t.style.display = "none"), 8000);
+}
+$("btnAsk").onclick = () => ask({});
+$("btnReindex").onclick = () => post("/reindex", {});
+$("askform").onsubmit = (e) => {
+  e.preventDefault();
+  const v = $("askInput").value.trim();
+  if (v) { ask({ text: v }); $("askInput").value = ""; }
+};
+document.addEventListener("keydown", (e) => {
+  const tag = (e.target.tagName || "").toLowerCase();
+  if (e.code === "Space" && !["input", "textarea", "button", "select"].includes(tag) && !e.target.isContentEditable) {
+    e.preventDefault();
+    ask({});
+  }
+});
+
+// ---------- SSE ----------
+function connect() {
+  const es = new EventSource("/events");
+  const on = (name, fn) => es.addEventListener(name, (e) => fn(JSON.parse(e.data)));
+  on("snapshot", (d) => {
+    info = d.info || {};
+    transcriptEl.innerHTML = ""; answersEl.innerHTML = ""; answers.clear();
+    (d.utts || []).forEach(addUtt);
+    (d.answers || []).forEach((a) => { const c = newCard(a); if (a.state !== "streaming") finishCard(c, a); });
+    $("emptyMsg").style.display = answers.size ? "none" : "";
+    status = d.status || {}; renderStatus();
+  });
+  on("utt", addUtt);
+  on("answer_start", (d) => newCard(d));
+  on("answer_delta", (d) => {
+    const c = cardFor(d.id); if (!c) return;
+    if (d.reset) c.text = "";
+    if (d.tool) c.el.querySelector(".meta").textContent = `searching vault (${d.tool})…`;
+    if (d.text) c.text += d.text;
+    renderBody(c);
+  });
+  on("answer_end", (d) => { const c = cardFor(d.id); if (c) finishCard(c, d); });
+  on("answer_skip", (d) => {
+    const c = cardFor(d.id); if (!c) return;
+    c.el.classList.remove("streaming"); c.el.classList.add("skipped");
+    setTimeout(() => { c.el.remove(); answers.delete(d.id); if (!answers.size) $("emptyMsg").style.display = ""; }, 700);
+  });
+  on("status", (d) => { Object.assign(status, d); renderStatus(); });
+  on("error", (d) => { status.last_error = d.message; toast(d.message); renderStatus(); });
+  es.onerror = () => { $("recText").textContent = "Disconnected – retrying…"; };
+}
+connect();
+</script>
+</body>
+</html>

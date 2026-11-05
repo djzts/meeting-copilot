@@ -1,0 +1,13 @@
+# Python 3.11+
+numpy>=1.24
+sounddevice>=0.4.6
+
+# Speech recognition: pick the backend for your machine
+faster-whisper>=1.0 ; sys_platform != "darwin" or platform_machine != "arm64"
+mlx-whisper>=0.4 ; sys_platform == "darwin" and platform_machine == "arm64"
+
+# Optional local semantic search (set [vault].embedding_model = "" to skip)
+sentence-transformers>=3.0
+
+# Tests
+pytest>=7
